@@ -21,6 +21,7 @@ This project is a WiFi-controlled car that can be controlled using a smartphone.
 ## Packages Required
 
 - Blynk by Volodymyr Shymanskyy
+- Firebase Ardinuo ESP Client by mobizt
 
 ## Boards Required
 
