@@ -4,9 +4,16 @@
 #define BLYNK_TEMPLATE_ID "TMPL60k6nWKVi"
 #define BLYNK_TEMPLATE_NAME "WiFi Controlled Car"
 
-#include <Arduino.h>
 #include <WiFi.h>
+#include <Firebase_ESP_Client.h>
 #include <BlynkSimpleEsp32.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+
+// Provide the token generation process info.
+#include "addons/TokenHelper.h"
+// Provide the RTDB payload printing info and other helper functions.
+#include "addons/RTDBHelper.h"
 
 // Motor control pins
 #define ENA 32 // Enable for Motor A
@@ -17,47 +24,91 @@
 #define IN4 14 // Motor B direction
 
 // Blynk authentication and Wi-Fi credentials from "credentials.h"
-#ifndef AUTH_TOKEN
-#error "AUTH_TOKEN not defined in credentials.h"
-#endif
-#ifndef WIFI_SSID
-#error "WIFI_SSID not defined in credentials.h"
-#endif
-#ifndef WIFI_PASS
-#error "WIFI_PASS not defined in credentials.h"
-#endif
-
 char auth[] = AUTH_TOKEN; 
 char ssid[] = WIFI_SSID;  
 char pass[] = WIFI_PASS;  
 
-// Variables for joystick values
-int x = 50; // Default value for X-axis
-int y = 50; // Default value for Y-axis
+int x = 50; // Default joystick X value
+int y = 50; // Default joystick Y value
 
-void setup() {
-  Serial.begin(115200);
-  Serial.println("Initializing...");
+FirebaseData fbdo;
+FirebaseAuth firebase_auth;
+FirebaseConfig config;
 
-  // Configure motor control pins as output
-  pinMode(ENA, OUTPUT);
-  pinMode(IN1, OUTPUT);
-  pinMode(IN2, OUTPUT);
-  pinMode(ENB, OUTPUT);
-  pinMode(IN3, OUTPUT);
-  pinMode(IN4, OUTPUT);
+unsigned long sendDataPrevMillis = 0;
+bool firebaseReady = false; // Flag for Firebase connection
+bool signupOK = false;
 
-  // Set initial states to LOW
-  digitalWrite(ENA, LOW);
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, LOW);
-  digitalWrite(ENB, LOW);
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, LOW);
+// Define NTP Client to get time
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP);
 
-  // Initialize Blynk connection
-  Blynk.begin(auth, ssid, pass);
-  Serial.println("Blynk connected. Ready to control the car!");
+// Movement log structure
+struct MovementLog {
+  String action;
+  String startTime;
+  String endTime;
+};
+
+String currentAction = "Stopped";
+String actionStartTime = "";
+#define MAX_LOGS 10
+MovementLog logs[MAX_LOGS];
+int logCount = 0;
+
+void addMovementLog(String action, String startTime, String endTime) {
+  if (logCount < MAX_LOGS) {
+    logs[logCount++] = {action, startTime, endTime};
+  } else {
+    Serial.println("Log storage full. Consider sending data to Firebase.");
+  }
+}
+
+String formatTimestamp() {
+  // Ensure the NTP client has the latest time
+  while (!timeClient.update()) {
+    timeClient.forceUpdate();  // Force update if the NTP client is out of sync
+  }
+
+  // Get the formatted date and time from the NTP client
+  String formattedDate = timeClient.getFormattedDate();
+
+  int splitT = formattedDate.indexOf("T");
+  String dayStamp = formattedDate.substring(0, splitT);
+  String timeStamp = formattedDate.substring(splitT + 1, formattedDate.length() - 1);
+
+
+  return dayStamp + " " + timeStamp;
+}
+
+void sendLogsToFirebase() {
+  if (logCount == 0 || !firebaseReady) return;
+
+  for (int i = 0; i < logCount; i++) {
+    FirebaseJson json;
+    json.set("action", logs[i].action);
+    json.set("startTime", logs[i].startTime);
+    json.set("endTime", logs[i].endTime);
+
+    // Push log entry to Firebase RTDB
+    if (!Firebase.RTDB.pushJSON(&fbdo, "/movementLogs", &json)) {
+      Serial.println("Failed to send log to Firebase.");
+      return;
+    }
+  }
+
+  Serial.println("Logs sent to Firebase successfully.");
+  logCount = 0; // Clear logs after sending
+}
+
+void updateMovement(String action) {
+  if (action != currentAction) {
+    if (currentAction != "Stopped") {
+      addMovementLog(currentAction, actionStartTime, formatTimestamp()); // Timestamp for both start and end
+    }
+    currentAction = action;
+    actionStartTime = formatTimestamp();
+  }
 }
 
 void carForward() {
@@ -79,62 +130,123 @@ void carBackward() {
 }
 
 void carLeft() {
-  digitalWrite(ENA, LOW); // Stop Motor A
-  digitalWrite(ENB, HIGH); // Motor B active
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, LOW);
-  digitalWrite(IN3, HIGH);
-  digitalWrite(IN4, LOW);
-}
-
-void carRight() {
-  digitalWrite(ENA, HIGH); // Motor A active
-  digitalWrite(ENB, LOW); // Stop Motor B
+  digitalWrite(ENA, HIGH);
+  digitalWrite(ENB, LOW);
   digitalWrite(IN1, HIGH);
   digitalWrite(IN2, LOW);
   digitalWrite(IN3, LOW);
   digitalWrite(IN4, LOW);
 }
 
+void carRight() {
+  digitalWrite(ENA, LOW);
+  digitalWrite(ENB, HIGH);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
 void carStop() {
-  digitalWrite(ENA, LOW); 
-  digitalWrite(ENB, LOW); 
+  digitalWrite(ENA, LOW);
+  digitalWrite(ENB, LOW);
   digitalWrite(IN1, LOW);
   digitalWrite(IN2, LOW);
   digitalWrite(IN3, LOW);
   digitalWrite(IN4, LOW);
 }
 
-// Blynk virtual pin handlers for joystick values
 BLYNK_WRITE(V0) {
-  x = constrain(param[0].asInt(), 0, 100); // Constrain X-axis value to [0, 100]
+  x = constrain(param[0].asInt(), 0, 100);
 }
 
 BLYNK_WRITE(V1) {
-  y = constrain(param[0].asInt(), 0, 100); // Constrain Y-axis value to [0, 100]
+  y = constrain(param[0].asInt(), 0, 100);
 }
 
-// Function to control the car based on joystick input
 void smartCarControl() {
   if (y > 70) {
-    carForward(); 
-    Serial.println("Moving Forward");
+    carForward();
+    updateMovement("Forward");
   } else if (y < 30) {
-    carBackward(); 
-    Serial.println("Moving Backward");
+    carBackward();
+    updateMovement("Backward");
   } else if (x < 30) {
-    carLeft(); 
-    Serial.println("Turning Left");
+    carLeft();
+    updateMovement("Left");
   } else if (x > 70) {
-    carRight(); 
-    Serial.println("Turning Right");
+    carRight();
+    updateMovement("Right");
   } else {
-    carStop(); 
-    Serial.println("Stopped");
+    carStop();
+    updateMovement("Stopped");
   }
 }
 
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Initializing...");
+
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(ENB, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  digitalWrite(ENA, LOW);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(ENB, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+
+  WiFi.begin(ssid, pass);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println(" Connected!");
+
+  // NTP client initialization
+  timeClient.begin();
+  timeClient.setTimeOffset(18000);
+
+  // Firebase configuration
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  config.token_status_callback = tokenStatusCallback;
+
+  // Set user email and password for Firebase authentication
+  firebase_auth.user.email = FIREBASE_EMAIL;
+  firebase_auth.user.password = FIREBASE_PASSWORD;
+
+  Firebase.begin(&config, &firebase_auth);
+  Firebase.reconnectWiFi(true);
+
+  Blynk.begin(auth, ssid, pass);
+  Serial.println("Blynk connected. Ready to control the car!");
+
+  actionStartTime = formatTimestamp();
+}
+
 void loop() {
-  Blynk.run();           // Run the Blynk process
-  smartCarControl();     // Call the car control function
+  Blynk.run();
+  smartCarControl();
+
+  if (Firebase.ready()) {
+    if (!firebaseReady) {
+      firebaseReady = true;
+      Serial.println("Firebase authenticated successfully!");
+    }
+
+    if (millis() - sendDataPrevMillis > 15000) {
+      sendDataPrevMillis = millis();
+      sendLogsToFirebase();
+    }
+  } else {
+    firebaseReady = false;
+    Serial.println("Waiting for Firebase authentication...");
+  }
 }
